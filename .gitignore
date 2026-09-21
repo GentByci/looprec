@@ -1,0 +1,6 @@
+# fetched / compiled by setup.ps1
+lib/
+# per-user settings
+config.json
+# a recording that was interrupted mid-capture
+*.recording.wav
