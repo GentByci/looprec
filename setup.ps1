@@ -10,22 +10,22 @@ New-Item -ItemType Directory -Force $lib | Out-Null
 $tmp = Join-Path ([IO.Path]::GetTempPath()) "looprec-setup-$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
 foreach ($name in 'NAudio.Core', 'NAudio.Wasapi') {
     $dll = Join-Path $lib "$name.dll"
-    if (Test-Path $dll) { Write-Host "  $name.dll already present"; continue }
+    if (Test-Path -LiteralPath $dll) { Write-Host "  $name.dll already present"; continue }
     Write-Host "  downloading $name 2.2.1..."
     New-Item -ItemType Directory -Force $tmp | Out-Null
     Invoke-WebRequest "https://www.nuget.org/api/v2/package/$name/2.2.1" -OutFile "$tmp\$name.zip"
-    Expand-Archive "$tmp\$name.zip" -DestinationPath "$tmp\$name" -Force
-    Copy-Item "$tmp\$name\lib\netstandard2.0\$name.dll" $dll
-    Unblock-File $dll
+    Expand-Archive -LiteralPath "$tmp\$name.zip" -DestinationPath "$tmp\$name" -Force
+    Copy-Item -LiteralPath "$tmp\$name\lib\netstandard2.0\$name.dll" -Destination $dll
+    Unblock-File -LiteralPath $dll
 }
-Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
 
-# Compile with Windows PowerShell, the one the shortcut uses.
+# Compile with Windows PowerShell, the one the shortcut uses. The path is quoted for a single-quoted string: O'Brien.
 $winps = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-Write-Host '  compiling LoopRec.Native.dll...'
-Remove-Item "$lib\LoopRec.Native.dll" -ErrorAction SilentlyContinue
-& $winps -NoProfile -ExecutionPolicy Bypass -Command ". '$root\core.ps1'; Initialize-LoopRecCore"
-if ($LASTEXITCODE -ne 0 -or -not (Test-Path "$lib\LoopRec.Native.dll")) { throw 'compile failed' }
+Write-Host '  compiling LoopRec.Native.Desktop.dll...'
+Get-ChildItem -LiteralPath $lib -Filter 'LoopRec.Native*.dll' | Remove-Item -ErrorAction SilentlyContinue   # incl. the old single-DLL name
+& $winps -NoProfile -ExecutionPolicy Bypass -Command ". '$($root -replace "'", "''")\core.ps1'; Initialize-LoopRecCore"
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath "$lib\LoopRec.Native.Desktop.dll")) { throw 'compile failed' }
 
 if (-not $NoShortcut) {   # no shortcut hotkey on purpose: the app registers its own (see config.json)
     $lnk = (New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path ([Environment]::GetFolderPath('Desktop')) 'LoopRec.lnk'))

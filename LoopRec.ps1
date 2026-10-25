@@ -3,9 +3,10 @@
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot\core.ps1"
 
-# A second launch just pokes the running instance.
+# A second launch just pokes the running instance. Local\ = per logged-on user: with Global\, another user's LoopRec
+# would be toggled, or its ACL would make this launch fail.
 $created = $false
-$toggleEvent = New-Object System.Threading.EventWaitHandle($false, 'AutoReset', 'Global\LoopRec.Toggle', [ref]$created)
+$toggleEvent = New-Object System.Threading.EventWaitHandle($false, 'AutoReset', 'Local\LoopRec.Toggle', [ref]$created)
 if (-not $created) { [void]$toggleEvent.Set(); exit }
 
 # WPF, not WinForms: WinForms' first System.Drawing.Font makes GDI+ enumerate every installed font (seconds, with big font libraries).
@@ -15,11 +16,13 @@ $log = Join-Path $env:TEMP 'LoopRec.log'
 function Write-Log($text) { try { Add-Content $log ("{0:HH:mm:ss.fff} {1}" -f (Get-Date), $text) } catch { } }
 function Show-Error($text) { Write-Log "ERROR $text"; [System.Windows.MessageBox]::Show($text, 'LoopRec', 'OK', 'Error') | Out-Null }
 function Invoke-Ui([scriptblock]$action) { try { & $action } catch { Show-Error "$($_.Exception.Message)`n`n$($_.ScriptStackTrace)" } }   # errors become message boxes, not crashes
+trap { Show-Error "LoopRec hit an error and has to close:`n$(Get-InnermostMessage $_.Exception)"; exit 1 }   # the shortcut runs hidden: never fail silently
 
-try { Initialize-LoopRecCore } catch { Show-Error $_.Exception.Message; exit 1 }
+Initialize-LoopRecCore
 [void][LoopRec.Native]::SetProcessDPIAware()
 $cfg = Get-LoopRecConfig
-$S = @{ rec = $null; temp = ''; stamp = ''; hold = 0.0; last = ''; ready = $false }   # mutable state, reachable from every handler
+# Mutable state, reachable from every handler. ids[i] is the endpoint ID behind DeviceBox item i ('' = default output).
+$S = @{ rec = $null; temp = ''; task = $null; length = ''; cutShort = $null; hold = 0.0; last = ''; ids = @(''); ready = $false }
 $red = (New-Object System.Windows.Media.BrushConverter).ConvertFromString('#C81E1E')
 
 # ---------------- window ----------------
@@ -66,17 +69,17 @@ function Fill-Devices {   # after the window is on screen: enumeration takes a m
     $enum = New-Object NAudio.CoreAudioApi.MMDeviceEnumerator
     try { $default = $enum.GetDefaultAudioEndpoint('Render', 'Multimedia').FriendlyName } catch { $default = 'none' }
     [void]$DeviceBox.Items.Add("Default output: $default")
-    $DeviceBox.SelectedIndex = 0
-    foreach ($d in $enum.EnumerateAudioEndPoints('Render', 'Active')) {
-        $i = $DeviceBox.Items.Add($d.FriendlyName)
-        if ($cfg.device -and $DeviceBox.SelectedIndex -eq 0 -and $d.FriendlyName -like "*$($cfg.device)*") { $DeviceBox.SelectedIndex = $i }
-    }
+    foreach ($d in $enum.EnumerateAudioEndPoints('Render', 'Active')) { [void]$DeviceBox.Items.Add($d.FriendlyName); $S.ids += $d.ID }
+    # Saved endpoint ID first (exact, so identical names can't mix up), else part of a name from a hand-edited config.
+    $sel = [array]::IndexOf($S.ids, [string]$cfg.device)
+    for ($i = 1; $sel -lt 1 -and $cfg.device -and $i -lt $S.ids.Count; $i++) { if ($DeviceBox.Items[$i].IndexOf([string]$cfg.device, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $sel = $i } }
+    $DeviceBox.SelectedIndex = [Math]::Max(0, $sel)
     $S.ready = $true
 }
 
 function Save-Settings {
     $cfg.outDir = $DirBox.Text.Trim()
-    if ($S.ready) { $cfg.device = if ($DeviceBox.SelectedIndex -le 0) { '' } else { [string]$DeviceBox.SelectedItem } }
+    if ($S.ready) { $cfg.device = $S.ids[[Math]::Max(0, $DeviceBox.SelectedIndex)] }
     $cfg.saveWav = [bool]$WavChk.IsChecked; $cfg.saveMp3 = [bool]$Mp3Chk.IsChecked; $cfg.openFolder = [bool]$OpenChk.IsChecked
     Save-LoopRecConfig $cfg
 }
@@ -93,44 +96,48 @@ function Start-Rec {
     if (-not $dir) { Show-Error 'Pick a folder to save into first.'; return }
     try { New-Item -ItemType Directory -Force $dir | Out-Null } catch { Show-Error "Can't create the folder:`n$dir"; return }
     Save-Settings
-    $S.stamp = Get-Date -Format 'yyyy-MM-dd HH-mm-ss'
-    $S.temp = Join-Path $dir "$($S.stamp).recording.wav"
-    Write-Log "start -> $($S.temp)"
-    try { $S.rec = New-Object LoopRec.Recorder($S.temp, $cfg.device, $true) }
-    catch {
-        $why = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
-        Show-Error "Could not start capturing:`n$why`n`nSome USB DACs refuse loopback - try another Source."; return
-    }
+    $S.temp = New-LoopRecTempPath $dir
+    try { $S.rec = New-Object LoopRec.Recorder($S.temp, $cfg.device) }
+    catch { Show-Error "Could not start capturing:`n$(Get-InnermostMessage $_.Exception)`n`nSome USB DACs refuse loopback - try another Source."; return }
+    Write-Log "start ($($S.rec.DeviceName)) -> $($S.temp)"
     $S.hold = 0.0; $Status.Text = 'REC 00:00'
     Set-Recording $true
 }
 
 function Stop-Rec {
     $r = $S.rec; $S.rec = $null
-    Write-Log 'stop'
     $r.Stop()
+    # A capture error (device unplugged, format changed, the 4 GB WAV limit) still saves everything recorded until then.
+    $S.cutShort = if ($r.Error) { $r.Error.Message }
+    Write-Log "stop$(if ($S.cutShort) { " early: $($S.cutShort)" })"
     Set-Recording $false
     $S.hold = 0.0; $MeterFill.Width = 0
-    if ($r.Error -or $r.Bytes -lt 1) {
-        Remove-Item $S.temp -ErrorAction SilentlyContinue
-        $Status.Text = if ($r.Error) { 'Ready' } else { 'Nothing came through - not saved' }
-        if ($r.Error) { Show-Error "Capture stopped:`n$($r.Error.Message)" }
+    if ($r.Bytes -lt 1) {
+        Remove-Item -LiteralPath $S.temp -ErrorAction SilentlyContinue
+        $Status.Text = 'Nothing came through - not saved'
+        if ($S.cutShort) { Show-Error "Capture stopped:`n$($S.cutShort)" }
         return
     }
+    $S.length = Format-LoopRecTime $r.Elapsed
     $Status.Text = 'Saving...'; $RecBtn.IsEnabled = $false
-    $window.Dispatcher.Invoke([Action]{}, [System.Windows.Threading.DispatcherPriority]::Render)   # repaint before the encode blocks
-    try { $result = Export-LoopRecording $S.temp $DirBox.Text.Trim() $S.stamp $cfg }
-    catch { $Status.Text = 'Ready'; $RecBtn.IsEnabled = $true; Show-Error "Saving failed:`n$($_.Exception.Message)"; return }
-    $RecBtn.IsEnabled = $true
-    Write-Log "saved -> $($result.Files -join ', ')"
-    $Status.Text = "Saved $($r.Elapsed.ToString('m\:ss'))" + $(if ($result.Warnings) { " ($($result.Warnings -join '; '))" })
-    if ($result.Files) {
-        $S.last = $result.Files[0]; $LastRun.Text = 'Last: ' + (Split-Path $S.last -Leaf)
-        if ($OpenChk.IsChecked) { Show-InExplorer $S.last }
-    }
+    $S.task = [LoopRec.Export]::SaveAsync($S.temp, [bool]$cfg.saveWav, [bool]$cfg.saveMp3, [int]$cfg.mp3Bitrate)   # the timer picks up the result
 }
 
-function Toggle-Rec { if ($S.rec) { Stop-Rec } else { Start-Rec } }
+function Complete-Save {
+    $t = $S.task; $S.task = $null; $RecBtn.IsEnabled = $true
+    if ($t.IsFaulted) {
+        $Status.Text = 'Saving failed'
+        Show-Error "Saving failed:`n$(Get-InnermostMessage $t.Exception)`n`nThe recording itself is untouched:`n$($S.temp)"; return
+    }
+    $res = $t.Result
+    Write-Log "saved -> $($res.Files -join ', ')"
+    $Status.Text = "Saved $($S.length)" + $(if ($res.Warnings) { " ($($res.Warnings -join '; '))" })
+    $S.last = $res.Files[0]; $LastRun.Text = 'Last: ' + (Split-Path $S.last -Leaf)
+    if ($OpenChk.IsChecked) { Show-InExplorer $S.last }
+    if ($S.cutShort) { Show-Error "Recording stopped early:`n$($S.cutShort)`n`nEverything captured until then was saved." }
+}
+
+function Toggle-Rec { if ($S.task) { return }; if ($S.rec) { Stop-Rec } else { Start-Rec } }   # ignored while a take is saving
 
 # ---------------- hotkey + events ----------------
 $spec = ConvertTo-HotkeySpec $cfg.hotkey
@@ -147,27 +154,29 @@ $BrowseBtn.Add_Click({ Invoke-Ui {
 $DirBox.Add_LostFocus({ if ($DirBox.Text.Trim()) { Invoke-Ui { Save-Settings } } })
 $DeviceBox.Add_SelectionChanged({ if ($S.ready) { Invoke-Ui { Save-Settings } } })
 foreach ($chk in $WavChk, $Mp3Chk, $OpenChk) { $chk.Add_Click({ Invoke-Ui { if (-not $WavChk.IsChecked -and -not $Mp3Chk.IsChecked) { $this.IsChecked = $true }; Save-Settings } }) }
-$LastLink.Add_Click({ if ($S.last -and (Test-Path $S.last)) { Show-InExplorer $S.last } })
+$LastLink.Add_Click({ if ($S.last -and (Test-Path -LiteralPath $S.last)) { Show-InExplorer $S.last } })
 
 $timer = New-Object System.Windows.Threading.DispatcherTimer -Property @{ Interval = [TimeSpan]::FromMilliseconds(100) }
 $timer.Add_Tick({
-    $poked = $toggleEvent.WaitOne(0)
-    if ($hotkey -and $hotkey.TakePress()) { $poked = $true }
-    if ($poked) {
-        Write-Log 'toggle'
-        if ($window.WindowState -eq 'Minimized') { $window.WindowState = 'Normal' }
-        [void]$window.Activate()
-        Invoke-Ui { Toggle-Rec }
-    }
+    $poked = $toggleEvent.WaitOne(0)                  # LoopRec launched again: bring the window up as well
+    $pressed = $hotkey -and $hotkey.TakePress()       # hotkey: leave focus in the app the user is working in
+    if ($poked) { if ($window.WindowState -eq 'Minimized') { $window.WindowState = 'Normal' }; [void]$window.Activate() }
+    if ($poked -or $pressed) { Write-Log 'toggle'; Invoke-Ui { Toggle-Rec } }
+    if ($S.task -and $S.task.IsCompleted) { Invoke-Ui { Complete-Save } }
     if (-not $S.rec) { return }
     if ($S.rec.Error) { Invoke-Ui { Stop-Rec }; return }
     $S.hold = [Math]::Max($S.rec.TakePeak(), $S.hold * 0.8)
-    $Status.Text = 'REC ' + $S.rec.Elapsed.ToString('mm\:ss')
+    $Status.Text = 'REC ' + (Format-LoopRecTime $S.rec.Elapsed)
     $db = if ($S.hold -gt 0) { 20 * [Math]::Log10($S.hold) } else { -99 }
     $MeterFill.Width = [Math]::Max(0.0, $MeterFill.Parent.ActualWidth - 2) * [Math]::Max(0.0, [Math]::Min(1.0, ($db + 60) / 60))
     $MeterFill.Fill = if ($db -gt -3) { [System.Windows.Media.Brushes]::OrangeRed } elseif ($db -gt -12) { [System.Windows.Media.Brushes]::Gold } else { [System.Windows.Media.Brushes]::LimeGreen }
 })
 
-$window.Add_ContentRendered({ Invoke-Ui { Fill-Devices }; $timer.Start(); [void]$RecBtn.Focus() })
-$window.Add_Closing({ $timer.Stop(); if ($S.rec) { Invoke-Ui { Stop-Rec } }; if ($hotkey) { $hotkey.Dispose() }; $toggleEvent.Dispose(); Write-Log 'closed' })
+$window.Add_ContentRendered({ Invoke-Ui { Fill-Devices }; $timer.Start(); [void]$RecBtn.Focus(); if ($ConfigWarning) { Show-Error $ConfigWarning } })
+$window.Add_Closing({
+    $timer.Stop()
+    if ($S.rec) { Invoke-Ui { Stop-Rec } }
+    if ($S.task) { try { $S.task.Wait() } catch { }; Invoke-Ui { Complete-Save } }   # finish saving before the process exits
+    if ($hotkey) { $hotkey.Dispose() }; $toggleEvent.Dispose(); Write-Log 'closed'
+})
 [void]$window.ShowDialog()

@@ -4,7 +4,7 @@ $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot\core.ps1"
 
 $created = $false
-$stopEvent = New-Object System.Threading.EventWaitHandle($false, 'AutoReset', 'Global\LoopRec.Toggle', [ref]$created)
+$stopEvent = New-Object System.Threading.EventWaitHandle($false, 'AutoReset', 'Local\LoopRec.Toggle', [ref]$created)
 if (-not $created) { [void]$stopEvent.Set(); exit }   # second launch = stop the first one
 
 function Fail($msg) {
@@ -14,10 +14,10 @@ function Fail($msg) {
 }
 try { Initialize-LoopRecCore } catch { Fail $_.Exception.Message }
 $cfg = Get-LoopRecConfig
+if ($ConfigWarning) { Write-Host "`n  $ConfigWarning" -ForegroundColor Yellow }
 New-Item -ItemType Directory -Force $cfg.outDir | Out-Null
-$stamp = Get-Date -Format 'yyyy-MM-dd HH-mm-ss'
-$temp = Join-Path $cfg.outDir "$stamp.recording.wav"
-try { $rec = New-Object LoopRec.Recorder($temp, $cfg.device, $true) } catch { Fail "Could not start capture: $($_.Exception.InnerException.Message)$($_.Exception.Message)" }
+$temp = New-LoopRecTempPath $cfg.outDir
+try { $rec = New-Object LoopRec.Recorder($temp, $cfg.device) } catch { Fail "Could not start capture: $(Get-InnermostMessage $_.Exception)" }
 
 $host.UI.RawUI.WindowTitle = 'LoopRec - recording'
 $keys = try { [Console]::TreatControlCAsInput = $true; [void][Console]::KeyAvailable; [Console]::CursorVisible = $false; $true } catch { $false }
@@ -28,17 +28,22 @@ while (-not $stopEvent.WaitOne(120) -and -not $rec.Error) {
     $hold = [Math]::Max($rec.TakePeak(), $hold * 0.8)
     $db = if ($hold -gt 0) { 20 * [Math]::Log10($hold) } else { -99 }
     $bar = ('#' * [Math]::Max(0, [Math]::Min(24, [int](($db + 60) / 60 * 24)))).PadRight(24, '.')
-    Write-Host ("`r  REC {0}  [{1}] {2,6:0.0} dB   " -f $rec.Elapsed.ToString('mm\:ss'), $bar, $db) -ForegroundColor Red -NoNewline
+    Write-Host ("`r  REC {0}  [{1}] {2,6:0.0} dB   " -f (Format-LoopRecTime $rec.Elapsed), $bar, $db) -ForegroundColor Red -NoNewline
 }
 $rec.Stop()
 if ($keys) { [Console]::CursorVisible = $true }
-if ($rec.Error) { Fail "Capture stopped with an error: $($rec.Error.Message)" }
-if ($rec.Bytes -lt 1) { Remove-Item $temp -ErrorAction SilentlyContinue; Fail 'Nothing came through the output device - no file saved.' }
+if ($rec.Bytes -lt 1) {
+    Remove-Item -LiteralPath $temp -ErrorAction SilentlyContinue
+    Fail $(if ($rec.Error) { "Capture failed: $($rec.Error.Message)" } else { 'Nothing came through the output device - no file saved.' })
+}
+# A capture error (device unplugged, format changed, the 4 GB WAV limit) still saves everything recorded until then.
+if ($rec.Error) { Write-Host "`n`n  Recording stopped early: $($rec.Error.Message)" -ForegroundColor Yellow }
 
 Write-Host "`n  Saving..." -ForegroundColor DarkGray
-$result = Export-LoopRecording $temp $cfg.outDir $stamp $cfg
+try { $result = [LoopRec.Export]::Save($temp, [bool]$cfg.saveWav, [bool]$cfg.saveMp3, [int]$cfg.mp3Bitrate) }
+catch { Fail "Saving failed: $(Get-InnermostMessage $_.Exception)`n  The recording itself is untouched: $temp" }
 foreach ($w in $result.Warnings) { Write-Host "  $w" -ForegroundColor Yellow }
-Write-Host "`n  Saved $($rec.Elapsed.ToString('m\:ss')):" -ForegroundColor Green
+Write-Host "`n  Saved $(Format-LoopRecTime $rec.Elapsed):" -ForegroundColor Green
 foreach ($f in $result.Files) { Write-Host "    $f" }
-if ($cfg.openFolder -and $result.Files) { Show-InExplorer $result.Files[0] }
+if ($cfg.openFolder) { Show-InExplorer $result.Files[0] }
 Start-Sleep 2
